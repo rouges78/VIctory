@@ -388,17 +388,23 @@ fn inputs(float: bool) -> Vec<(&'static str, [u32; 32])> {
             };
             (scale * x).to_bits()
         });
-        let with = |nans: &[usize]| {
+        let with = |lanes: &[usize], x: u32| {
             let mut v = plain;
-            for &l in nans {
-                v[l] = NAN;
+            for &l in lanes {
+                v[l] = x;
             }
             v
         };
+        // The plain terms sum exactly in any order, and a sum that holds
+        // 2^60 rounds to it: a prefix made as the sum up to the lane less
+        // the lane's own term shows in the lane of the NaN, of 2^60 (0 for
+        // the terms below) and of the infinity (a NaN).
         vec![
             ("floats", plain),
-            ("floats, NaN in lanes 9 and 20", with(&[9, 20])),
-            ("floats, NaN in lane 0", with(&[0])),
+            ("floats, NaN in lanes 9 and 20", with(&[9, 20], NAN)),
+            ("floats, NaN in lane 0", with(&[0], NAN)),
+            ("floats, 2^60 in lane 11", with(&[11], 0x5D80_0000)),
+            ("floats, infinity in lane 11", with(&[11], 0x7F80_0000)),
         ]
     } else {
         // Around 0x8000_0000 the order differs between signed and unsigned.
