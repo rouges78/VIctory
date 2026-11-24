@@ -344,7 +344,9 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -402,8 +404,13 @@ impl State {
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    /// descriptors its tables hold. False if a table or root view a shader
+    /// reads cannot be bound: the draw or dispatch must not run then (it
+    /// would read whatever the host slot or root argument last held, and
+    /// data like that has run shaders until the host reset the driver).
+    /// What was bound before the failure stays as the host list has it;
+    /// every bind sets all its own root arguments.
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -446,7 +453,10 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let made = self.tables(list, &t.used, compute);
+            let Some(made) = self.tables(list, &t.used, compute) else {
+                once!(pipeline = %p.name, "a table a shader reads is not bound: dropped");
+                return false;
+            };
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -471,11 +481,12 @@ impl State {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
+                        once!(slot, "a shader reads a root view the title did not set: dropped");
+                        return false;
                     };
                     let Some(gpu) = root_view(list, *address, srv) else {
-                        continue;
+                        once!(slot, "a root view without a host copy: dropped");
+                        return false;
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
@@ -489,6 +500,7 @@ impl State {
                 }
             }
         }
+        true
     }
 
     /// Runs a dispatch on the host.
@@ -513,7 +525,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -590,20 +605,24 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    /// False if the entry has no host slot: the title set no table there,
+    /// or one outside the bound heaps. (A slot holding no view is a null
+    /// view, which reads zeros.)
+    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) -> bool {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-            return;
+            return false;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
         let Some(heap) = self.heap_of(handle) else {
-            return;
+            return false;
         };
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return;
+            return false;
         };
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u, &view);
         }
+        true
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -617,7 +636,17 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    ///
+    /// `None` if a table has no host slots: the title set none, it is
+    /// outside the bound heaps, or no dynamic slots are free for it (more
+    /// than a heap has, or all taken). The shader would otherwise get the
+    /// title's own offset, which on a capped heap is past the host's.
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+    ) -> Option<Vec<(u8, u32)>> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -649,26 +678,22 @@ impl State {
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+            if !fresh.contains(&u.slot) && !self.table_entry(list, u, compute) {
+                return None;
             }
         }
         let mut made = Vec::new();
         for slot in fresh {
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
-                continue;
+            let &Root::Table(table) = self.roots_ref(compute).get(usize::from(slot))? else {
+                return None;
             };
             let entries: Vec<&UsedResource> = used
                 .iter()
                 .filter(tables)
                 .filter(|u| u.slot == slot)
                 .collect();
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
-            let Some(host) = heap.host() else {
-                continue;
-            };
+            let heap = self.heap_of(table)?;
+            let host = heap.host()?;
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
@@ -695,9 +720,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
-                continue;
-            };
+            let first = host.dynamic(n)?;
             self.fresh_tables.insert(key, first);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
@@ -731,7 +754,7 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        made
+        Some(made)
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -973,6 +996,29 @@ impl State {
             why("no host signature");
             return false;
         };
+        // Not run without its pipeline: known before the clamp changes the
+        // arguments and spends the list's budget on them.
+        let kinds = match kind {
+            DISPATCH => (true, false),
+            MESH => (false, true),
+            _ => (false, false),
+        };
+        match crate::pipeline::host_pipeline(self.pipeline as This) {
+            Some(p) if (p.compute, p.mesh) == kinds => {}
+            Some(p) => {
+                why(&format!("another kind of pipeline (compute {}, mesh {})", p.compute, p.mesh));
+                return false;
+            }
+            None => {
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_drop(self.pipeline as This);
+                return false;
+            }
+        }
+        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
+            why("indirect rectangles not drawn");
+            return false;
+        }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
@@ -985,13 +1031,10 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => {
-                    self.bind(list, p, true);
-                    true
-                }
+                Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,
@@ -1179,4 +1222,84 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A table entry of `kind` a shader reads through root parameter 0.
+    fn entry(kind: ResourceType, table_offset_dwords: u32) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }
+    }
+
+    /// A shader-visible view heap of `count` slots, as the title makes one.
+    fn view_heap(count: u32) -> This {
+        // The description (kind, count, flags, nodes), then no placement.
+        let desc = [0u32, count, 1, 0, 0, 0, 0, 0];
+        let mut heap = std::ptr::null();
+        crate::descriptor::create_heap(
+            std::ptr::null(),
+            desc.as_ptr().cast(),
+            &crate::resource::PAGEABLE_IIDS[0],
+            &mut heap,
+        );
+        assert!(!heap.is_null());
+        heap
+    }
+
+    /// A shader that reads a table the title did not set is not bound,
+    /// whether the table would be the title's or made afresh.
+    #[test]
+    fn a_table_the_title_did_not_set_is_not_bound() {
+        let Some(list) = crate::host::host().and_then(|h| h.new_list().ok()) else {
+            return; // no host GPU here
+        };
+        let mut state = State::default();
+        for kind in [ResourceType::Srv, ResourceType::Cbv] {
+            assert_eq!(state.tables(&list, &[entry(kind, 0)], true), None, "{kind:?}");
+        }
+    }
+
+    /// A table made afresh that gets no dynamic slots is not bound (more
+    /// slots than a heap has, which gives no warning, or none left), and
+    /// leaves the tables already made as they were.
+    #[test]
+    fn a_table_without_dynamic_slots_is_not_bound() {
+        let Some(list) = crate::host::host().and_then(|h| h.new_list().ok()) else {
+            return; // no host GPU here
+        };
+        // A heap's dynamic slots (`descriptor::host::DYNAMIC`).
+        const DYNAMIC: u32 = 1 << 16;
+        let count = DYNAMIC + 64;
+        let heap = view_heap(count);
+        let start = crate::descriptor::heap(heap).start;
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 0, start);
+        // Entry DYNAMIC of the table: DYNAMIC + 1 slots.
+        let too_long = [entry(ResourceType::Cbv, DYNAMIC * 8)];
+        assert_eq!(state.tables(&list, &too_long, true), None);
+        // Two slots are made, in the dynamic ones past the title's.
+        let two = [entry(ResourceType::Cbv, 8)];
+        let made = state.tables(&list, &two, true).expect("slots are free");
+        assert!(matches!(made[..], [(0, offset)] if offset / 32 >= count), "{made:?}");
+        // The rest taken: another table has none.
+        let host = crate::descriptor::heap(heap).host().expect("made above");
+        assert!(host.dynamic(DYNAMIC - 2).is_some());
+        state.set_table(true, 0, start + 64);
+        assert_eq!(state.tables(&list, &two, true), None);
+        // The first is still the one made before.
+        state.set_table(true, 0, start);
+        assert_eq!(state.tables(&list, &two, true), Some(made));
+    }
 }
