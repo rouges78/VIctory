@@ -56,7 +56,10 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    /// Shared so a list holds it until reset: the title may release the
+    /// heap before the list runs, and the host heap holds the resources
+    /// its slots view.
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
 }
@@ -78,7 +81,7 @@ impl Heap {
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
         if let Some(h) = self.host.get() {
-            return h.as_ref();
+            return h.as_deref();
         }
         if self.desc.flags & SHADER_VISIBLE == 0 || !matches!(self.desc.kind, VIEWS_KIND | SAMPLERS)
         {
@@ -94,9 +97,16 @@ impl Heap {
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
-                Some(h)
+                Some(std::sync::Arc::new(h))
             })
-            .as_ref()
+            .as_deref()
+    }
+
+    /// The host heap, shared, for a list to hold until it is reset.
+    #[cfg(windows)]
+    pub(crate) fn host_shared(&self) -> Option<std::sync::Arc<host::HostHeap>> {
+        self.host()?;
+        self.host.get()?.clone()
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
@@ -164,6 +174,21 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        if self
+            .host
+            .get()
+            .and_then(Option::as_ref)
+            .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
+        {
+            // Before lists held host heaps, this freed the resources their
+            // slots view under lists not yet run.
+            static OUTLIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = OUTLIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(n, "a descriptor heap was released while a list not yet reset names it");
+            }
+        }
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);

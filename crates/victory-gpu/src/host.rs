@@ -411,6 +411,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The host descriptor heaps the list binds, with the resources their
+    /// slots view: the title may release a heap before it submits the list.
+    heaps: Vec<std::sync::Arc<crate::descriptor::host::HostHeap>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1158,6 +1161,15 @@ impl HostList {
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
+        }
+    }
+
+    /// Keeps a host descriptor heap, and what its slots view, until the
+    /// list is reset.
+    pub(crate) fn keep_heap(&self, heap: std::sync::Arc<crate::descriptor::host::HostHeap>) {
+        let mut deferred = self.deferred();
+        if !deferred.heaps.iter().any(|h| std::sync::Arc::ptr_eq(h, &heap)) {
+            deferred.heaps.push(heap);
         }
     }
 

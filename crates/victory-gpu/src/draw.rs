@@ -420,14 +420,17 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            let shared: Vec<_> = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
+                .filter_map(|&h| crate::descriptor::heap(h as This).host_shared())
                 .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> =
+                shared.iter().map(|h| Some(h.heap.clone())).collect();
+            // The host heaps, not only their descriptor heaps: they hold
+            // the resources their slots view.
+            shared.into_iter().for_each(|h| list.keep_heap(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;

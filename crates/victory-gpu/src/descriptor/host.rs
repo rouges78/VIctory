@@ -1026,6 +1026,31 @@ mod tests {
         assert_eq!(references(&buffer), before);
     }
 
+    /// A list holds a host heap it binds, with what its slots view, until
+    /// it is reset: the title may release the heap before the list runs.
+    #[test]
+    fn a_list_holds_its_host_heaps_until_reset() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let heap = std::sync::Arc::new(HostHeap::new(false, 4).expect("a host heap"));
+        let (buffer, _) = host.upload_buffer(256).expect("a host buffer");
+        heap.keep(1, Some(buffer.clone()));
+        let before = references(&buffer);
+        let list = host.new_list().expect("a host list");
+        list.keep_heap(heap.clone());
+        list.keep_heap(heap.clone());
+        let held = std::sync::Arc::downgrade(&heap);
+        drop(heap); // the title releases its heap
+        assert!(held.upgrade().is_some(), "the heap went with the title's");
+        assert_eq!(references(&buffer), before);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(held.upgrade().is_none(), "the heap outlived the list's reset");
+        assert_eq!(references(&buffer), before - 1);
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
