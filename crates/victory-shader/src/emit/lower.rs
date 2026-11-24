@@ -222,9 +222,14 @@ struct Lower<'a> {
 /// [`super::loop_limit`] says otherwise. The console runs a loop as long as
 /// its data says; data the host has not mirrored yet (a null view reads
 /// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
+/// until the driver resets it. A lane that reaches the limit on an
+/// unconditional back edge leaves the program as killed (a pixel discards);
+/// on a conditional one it leaves the loop by its ordinary exit and runs on.
 // shortcut: a genuine loop of more iterations than this is cut short too.
+// shortcut: the count starts again at each entry into the loop, and a lane
+// stopped at a conditional back edge goes on to the enclosing loop, so
+// nested loops still multiply (2^40 iterations for two): the limit bounds a
+// loop, not a program's time.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
