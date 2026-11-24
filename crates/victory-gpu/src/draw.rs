@@ -979,7 +979,7 @@ impl State {
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            why("not bounded (no clamp, arguments not 4-byte aligned, or over 65,536 records)");
             return false;
         }
         self.host_pipeline = 0;
