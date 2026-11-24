@@ -1,15 +1,17 @@
 //! Readback of wave prefixes: synthetic wave32 compute programs whose
 //! whole-wave section leaves the prefix of one operation over the lanes'
 //! own inputs, lowered to DXIL (`wavePrefixOp`), validated by `dxil.dll`
-//! when present, and run on the host GPU and WARP. Each of the 32 lanes
-//! loads its own dword of a structured buffer and stores the prefix to its
-//! own dword of a raw UAV, which is compared with the console's
-//! instructions run on the CPU.
+//! when present, and run on every hardware adapter (the answer is the
+//! driver's, so one GPU does not speak for another) and on WARP. Each of
+//! the 32 lanes loads its own dword of a structured buffer and stores the
+//! prefix to its own dword of a raw UAV, which is compared with the
+//! console's instructions run on the CPU.
 //!
 //! DXIL documents `wavePrefixOp` for sums and products only; no compiler
 //! emits the minimum and maximum kinds and `dxil.dll` does not check the
 //! kind, so only a driver says what they do.
 
+use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::Interface;
@@ -23,6 +25,10 @@ use crate::native::{
 use crate::{io, ir, resource, structure};
 
 const NAN: u32 = 0x7FC0_0000;
+/// What every lane stores before the section: a lane that then stores
+/// nothing is told from one that stores 0. Not an input, an identity or a
+/// NaN.
+const SENTINEL: u32 = 0xDEAD_BEEF;
 
 /// A scanned operation: its VOP2 opcode, its identity, and the `row_shr`
 /// distances of the scan inside each row of 16 lanes.
@@ -84,8 +90,9 @@ impl Scan {
     }
 
     /// The program: lane `v0` loads dword `v0` of the structured buffer at
-    /// entry 0 of the table at s0, a whole-wave section scans it, and the
-    /// lane stores the prefix to dword `v0` of the raw UAV at entry 1.
+    /// entry 0 of the table at s0 and stores [`SENTINEL`] to dword `v0` of
+    /// the raw UAV at entry 1, a whole-wave section scans what it loaded,
+    /// and the lane stores the prefix over the sentinel.
     ///
     /// The inclusive section is that of `a_wave_prefix_of_min_lowers`. The
     /// exclusive one first moves every lane's term one lane up (lane 16's
@@ -125,6 +132,10 @@ impl Scan {
             0xE030_1000,
             0x8006_0C10, // buffer_load_dword v12, v16, s[24:27], 0 offen
             0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x7E08_02FF, // v_mov_b32 v4, SENTINEL
+            SENTINEL,
+            0xE070_1000,
+            0x800A_0410, // buffer_store_dword v4, v16, s[40:43], 0 offen
             0xBE84_3DC1, // s_or_saveexec_b32 s4, -1
             0x876A_C104, // s_and_b32 s106, s4, -1
         ];
@@ -268,8 +279,58 @@ fn build(words: &[u32]) -> Result<HostShader, String> {
     Ok(shader)
 }
 
-/// The adapter of `host`, its driver version and the wave sizes it runs.
-fn adapter(host: &Host) -> String {
+/// Every hardware adapter with SM 6.6 (none with `VICTORY_WARP=1`), then
+/// WARP, each with whether it is WARP.
+fn hosts() -> Vec<(bool, Host)> {
+    let mut out = Vec::new();
+    let hardware = !std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    // SAFETY: plain D3D12/DXGI calls with valid out pointers.
+    unsafe {
+        let factory = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).ok();
+        let adapters = factory
+            .iter()
+            .filter(|_| hardware)
+            .flat_map(|f| (0..).map_while(|i| f.EnumAdapters1(i).ok()));
+        // One GPU can be listed more than once (a virtual display's adapter
+        // renders on it): once per model is enough to hear its driver.
+        let mut seen = Vec::new();
+        for a in adapters {
+            let Ok(d) = a.GetDesc1() else {
+                continue;
+            };
+            let model = (d.VendorId, d.DeviceId, d.SubSysId);
+            let software = d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            let mut device: Option<ID3D12Device> = None;
+            if software
+                || seen.contains(&model)
+                || D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut device).is_err()
+            {
+                continue;
+            }
+            seen.push(model);
+            let Some(device) = device else {
+                continue;
+            };
+            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            };
+            let asked = device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            );
+            if asked.is_ok() && sm.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0 {
+                out.push((false, Host { device }));
+            }
+        }
+    }
+    out.extend(Host::new(true).ok().map(|h| (true, h)));
+    out
+}
+
+/// The name of the adapter of `host`, its driver version, and the smallest
+/// and largest wave it runs.
+fn adapter(host: &Host) -> (String, String, std::ops::RangeInclusive<u32>) {
     // SAFETY: plain D3D12/DXGI calls with valid out pointers.
     unsafe {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
@@ -278,27 +339,31 @@ fn adapter(host: &Host) -> String {
             (&raw mut o).cast(),
             size_of_val(&o) as u32,
         );
-        let waves = format!("waves of {} to {}", o.WaveLaneCountMin, o.WaveLaneCountMax);
+        let waves = o.WaveLaneCountMin..=o.WaveLaneCountMax;
         let luid = host.device.GetAdapterLuid();
-        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
-            return waves;
-        };
-        let found = (0..)
-            .map_while(|i| factory.EnumAdapters1(i).ok())
-            .filter_map(|a| Some((a.GetDesc1().ok()?, a)))
-            .find(|(d, _)| d.AdapterLuid == luid);
+        let found = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .ok()
+            .and_then(|f| {
+                (0..)
+                    .map_while(|i| f.EnumAdapters1(i).ok())
+                    .filter_map(|a| Some((a.GetDesc1().ok()?, a)))
+                    .find(|(d, _)| d.AdapterLuid == luid)
+            });
         let Some((desc, a)) = found else {
-            return waves;
+            return ("hardware".to_string(), String::new(), waves);
         };
         let name = String::from_utf16_lossy(&desc.Description);
         let v = a.CheckInterfaceSupport(&IDXGIDevice::IID).unwrap_or(0);
-        format!(
-            "{}, driver {}.{}.{}.{}, {waves}",
-            name.trim_end_matches('\0'),
-            v >> 48,
-            v >> 32 & 0xFFFF,
-            v >> 16 & 0xFFFF,
-            v & 0xFFFF
+        (
+            name.trim_end_matches('\0').to_string(),
+            format!(
+                "driver {}.{}.{}.{}",
+                v >> 48,
+                v >> 32 & 0xFFFF,
+                v >> 16 & 0xFFFF,
+                v & 0xFFFF
+            ),
+            waves,
         )
     }
 }
@@ -351,8 +416,8 @@ fn inputs(float: bool) -> Vec<(&'static str, [u32; 32])> {
     }
 }
 
-/// Runs the prefix of `s` on the hardware GPU and on WARP, and compares
-/// what each lane stored with the console's result.
+/// Runs the prefix of `s` on every hardware adapter and on WARP, and
+/// compares what each lane stored with the console's result.
 fn reads_back(s: Scan, inclusive: bool) {
     let form = if inclusive { "inclusive" } else { "exclusive" };
     let what = format!("{form} prefix of {}", s.name);
@@ -377,19 +442,18 @@ fn reads_back(s: Scan, inclusive: bool) {
         .unwrap_or_else(|e| e.into_inner());
     let mut failures = Vec::new();
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+    for (warp, host) in hosts() {
+        let (name, driver, waves) = adapter(&host);
+        let label = if warp { "warp" } else { name.as_str() };
+        let (least, most) = (waves.start(), waves.end());
+        eprintln!("{label}: {driver}, waves of {least} to {most}");
+        // WARP runs waves of 4 lanes and refuses one fixed at 32.
+        if !waves.contains(&32) {
+            eprintln!("{label}: {what}: skipped (no wave of 32 lanes)");
             continue;
-        };
-        eprintln!("{label}: {}", adapter(&host));
+        }
         let (root, pso) = match host.compute_pipeline(&shader) {
             Ok(p) => p,
-            // WARP runs waves of 4 lanes and refuses one fixed at 32.
-            Err(e) if warp => {
-                eprintln!("{label}: {what}: skipped ({e})");
-                continue;
-            }
             Err(e) => {
                 eprintln!("{label}: {what}: PIPELINE REFUSED ({e})");
                 failures.push(format!("{label}: pipeline refused: {e}"));
@@ -418,8 +482,14 @@ fn reads_back(s: Scan, inclusive: bool) {
                     groups: [1, 1, 1],
                 },
             );
+            // SAFETY: a plain D3D12 call.
+            let removed = unsafe { host.device.GetDeviceRemovedReason() };
+            let got = got.and_then(|words| match removed {
+                Ok(()) => Ok(words[0].clone()),
+                Err(e) => Err(format!("device removed: {}", e.message())),
+            });
             let got = match got {
-                Ok(words) => words[0].clone(),
+                Ok(words) => words,
                 Err(e) => {
                     eprintln!("{label}: {what}, {set}: DISPATCH FAILED ({e})");
                     failures.push(format!("{label}: {set}: dispatch failed: {e}"));
@@ -427,28 +497,43 @@ fn reads_back(s: Scan, inclusive: bool) {
                 }
             };
             let wrong: Vec<usize> = (0..32).filter(|&l| !same(&s, got[l], want[l])).collect();
+            // Where every term up to a lane is a NaN the console keeps the
+            // NaN (no step of the scan folds a lone term), and the
+            // lowering's FMin or FMax of the prefix and the term gives the
+            // prefix: the lowering's doing, whatever the driver answers.
+            let all_nan = |l: usize| input[..=l].iter().all(|&x| f32::from_bits(x).is_nan());
+            let folded = s.float && inclusive && s.opcode != SUM_F32.opcode;
+            let by_fold = wrong.iter().filter(|&&l| folded && all_nan(l)).count();
+            let unstored = got.iter().filter(|&&x| x == SENTINEL).count();
             match wrong.first() {
                 None => eprintln!("{label}: {what}, {set}: EXACT"),
                 Some(&l) => {
-                    eprintln!(
-                        "{label}: {what}, {set}: WRONG in {} lanes, first lane {l}: \
-                         got {:#010x}, want {:#010x}\n   in {input:08x?}\n  got {got:08x?}\n want {want:08x?}",
+                    let mut summary = format!(
+                        "{} lanes wrong, first lane {l}: got {:#010x}, want {:#010x}",
                         wrong.len(),
                         got[l],
                         want[l],
                     );
-                    failures.push(format!(
-                        "{label}: {set}: {} lanes wrong, first lane {l}: got {:#010x}, want {:#010x}",
-                        wrong.len(),
-                        got[l],
-                        want[l],
-                    ));
+                    if unstored > 0 {
+                        summary += &format!("; {unstored} lanes stored nothing");
+                    }
+                    if by_fold > 0 {
+                        summary += &format!("; {by_fold} by the fold of an all-NaN prefix");
+                    }
+                    eprintln!(
+                        "{label}: {what}, {set}: WRONG, {summary}\n   in {input:08x?}\n  \
+                         got {got:08x?}\n want {want:08x?}"
+                    );
+                    failures.push(format!("{label}: {set}: {summary}"));
                 }
             }
         }
     }
     assert!(failures.is_empty(), "{what}: {failures:#?}");
-    assert!(ran > 0, "{what}: ran on no device");
+    // A machine with WARP alone (CI) has nothing to say about a driver.
+    if ran == 0 {
+        eprintln!("{what}: ran on no device");
+    }
 }
 
 macro_rules! prefixes {
