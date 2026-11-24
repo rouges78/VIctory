@@ -324,6 +324,16 @@ type States = std::collections::HashMap<
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
 
+/// Whether a submission is on the host GPU (diagnostics).
+#[cfg(feature = "diagnostics")]
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a submission is on the host GPU now (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn submission_running() -> bool {
+    RUNNING.load(Ordering::Relaxed)
+}
+
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
 pub(crate) fn dred_on() -> bool {
@@ -449,6 +459,13 @@ impl Host {
         })
     }
 
+    /// Holds submissions off (tests): none starts while the guard lives,
+    /// as while one runs.
+    #[cfg(test)]
+    pub(crate) fn hold_submissions(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -494,6 +511,9 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Nothing runs on the host GPU now: what heap slots let go of since
+        // the last submission started can be freed.
+        crate::descriptor::host::release_retired();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -524,6 +544,8 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(feature = "diagnostics")]
+        RUNNING.store(true, Ordering::Relaxed);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -553,6 +575,8 @@ impl Host {
             }
             let _ = (i, started);
         }
+        #[cfg(feature = "diagnostics")]
+        RUNNING.store(false, Ordering::Relaxed);
         let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);

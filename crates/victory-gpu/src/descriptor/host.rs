@@ -58,6 +58,19 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
+/// Host resources slots let go of, until the next submission starts.
+/// Recording threads remake slots while a submission runs, and that
+/// submission may already have read the slot's old descriptor: freeing its
+/// resource then is a GPU page fault inside a freed texture (#597).
+static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+
+/// Frees what slots let go of. Only while no submission runs: the host
+/// calls it as a submission starts (one at a time, each waited for).
+pub(crate) fn release_retired() {
+    let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(retired);
+}
+
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
@@ -298,11 +311,25 @@ impl HostHeap {
         self.keep(index, None);
     }
 
-    /// Slot `index` now views `resource` (or nothing of the host's).
+    /// Slot `index` now views `resource` (or nothing of the host's). What
+    /// it viewed before lives until the next submission starts.
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            *slot = resource;
+        let Some(slot) = kept.get_mut(index as usize) else {
+            return;
+        };
+        if let Some(old) = std::mem::replace(slot, resource) {
+            #[cfg(feature = "diagnostics")]
+            if crate::host::submission_running() {
+                // Before slots kept these, this freed them under a running
+                // submission (#597).
+                static UNDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = UNDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(n, "a heap slot let go of a resource while a submission ran");
+                }
+            }
+            RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(old);
         }
     }
 
@@ -956,6 +983,47 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The references to `r`, not counting those this takes.
+    fn references(r: &ID3D12Resource) -> u32 {
+        use windows::core::Interface;
+        let u: windows::core::IUnknown = r.cast().expect("a COM object");
+        // SAFETY: a balanced AddRef and Release on a live object.
+        let n = unsafe {
+            (u.vtable().AddRef)(u.as_raw());
+            (u.vtable().Release)(u.as_raw())
+        };
+        n - 1
+    }
+
+    /// What a slot lets go of lives until the next submission starts: one
+    /// running may already have read the slot's old descriptor (#597).
+    #[test]
+    fn a_slot_keeps_what_it_let_go_of_until_the_next_submission() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let heap = HostHeap::new(false, 4).expect("a host heap");
+        let (buffer, _) = host.upload_buffer(256).expect("a host buffer");
+        let before = references(&buffer);
+        heap.keep(1, Some(buffer.clone()));
+        assert_eq!(references(&buffer), before + 1);
+        {
+            let _running = host.hold_submissions();
+            heap.make_null(1);
+            assert_eq!(
+                references(&buffer),
+                before + 1,
+                "freed while a submission may still read the slot"
+            );
+        }
+        {
+            // No submission runs while this is held (other tests' either).
+            let _idle = host.hold_submissions();
+            release_retired();
+        }
+        assert_eq!(references(&buffer), before);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
