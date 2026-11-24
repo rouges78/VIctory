@@ -732,9 +732,9 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
+            let mut filled = true;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -743,7 +743,12 @@ impl State {
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                            // No upload memory for the constants. The null
+                            // view is a texture's, read as a buffer like the
+                            // title's slots above (#59): dropped as well.
                             host.make_null(index);
+                            self.table_failed = true;
+                            filled = false;
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
@@ -762,6 +767,11 @@ impl State {
                         }
                     }
                 }
+            }
+            // Kept for the list's later draws only when whole; the slots
+            // of one that is not stay the list's until its reset.
+            if filled {
+                self.fresh_tables.insert(key, first);
             }
             made.push((slot, first * 32));
         }
