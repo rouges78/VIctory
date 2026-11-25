@@ -143,13 +143,17 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_from(device, SOURCE)
+}
+
+fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -381,7 +385,12 @@ fn record_clamp(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            // Experiment: VICTORY_CLAMP_GROUP is the clamp file's threads per group.
+            let group = std::env::var("VICTORY_CLAMP_GROUP")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(64);
+            l.Dispatch(records.div_ceil(group), 1, 1);
         }
         l.ResourceBarrier(&[
             uav_barrier(),
@@ -487,9 +496,27 @@ void main() {
                 }
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+                // Experiment: VICTORY_TEST_HW picks the first hardware adapter.
+                let hardware = std::env::var_os("VICTORY_TEST_HW").is_some();
+                let adapter: IDXGIAdapter = if hardware {
+                    let mut found = None;
+                    let mut i = 0;
+                    while let Ok(a) = factory.EnumAdapters1(i) {
+                        let d = a.GetDesc1().ok()?;
+                        if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                            let name = String::from_utf16_lossy(&d.Description);
+                            eprintln!("adapter: {}", name.trim_end_matches('\0'));
+                            found = Some(a.cast::<IDXGIAdapter>().ok()?);
+                            break;
+                        }
+                        i += 1;
+                    }
+                    found?
+                } else {
+                    factory.EnumWarpAdapter().ok()?
+                };
                 let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                if !hardware && desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
                     return None;
                 }
                 let mut device: Option<ID3D12Device> = None;
@@ -521,7 +548,14 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
-                let clamp = make_for(&device).expect("clamp shader must compile on WARP");
+                // Experiment: VICTORY_CLAMP_HLSL replaces the clamp's source.
+                let clamp = match std::env::var_os("VICTORY_CLAMP_HLSL") {
+                    Some(path) => {
+                        let source = std::fs::read_to_string(&path).expect("the clamp file reads");
+                        make_from(&device, &source).expect("the clamp file compiles")
+                    }
+                    None => make_for(&device).expect("clamp shader must compile on WARP"),
+                };
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,
@@ -1219,5 +1253,277 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    // ---------------------------------------------------------------
+    // Experiment (not for upstream): clamp variants from a file, on WARP
+    // or on the hardware adapter, checked against the budget policy and
+    // timed.
+    // ---------------------------------------------------------------
+
+    const SENTINEL: u32 = 0xDEAD_BEEF;
+    const CAP: u32 = 1 << 27;
+
+    /// One clamp of draw records (`kind` 0) `stride` bytes apart, from
+    /// budget `start`: the seconds its submission took, the scratch words
+    /// after, the budget word after.
+    fn run_clamp(
+        h: &mut WarpHarness,
+        stride: u32,
+        src_words: &[u32],
+        count: Option<u32>,
+        start: u32,
+    ) -> (f64, Vec<u32>, u32) {
+        let bytes = src_words.len() * 4;
+        let records = (bytes / stride as usize) as u32;
+        let (src_buf, src_ptr, _) = h.shared_buffer(bytes as u64);
+        let (fill_buf, fill_ptr, _) = h.shared_buffer(bytes as u64);
+        let (readback_buf, readback_ptr, _) = h.shared_buffer(bytes as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = h.shared_buffer(256);
+        let (count_buf, count_ptr, _) = h.shared_buffer(256);
+        let dst_buf = h.default_uav(bytes as u64);
+        // SAFETY: mapped buffers of these sizes; an open list.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_words.as_ptr(), src_ptr.cast::<u32>(), src_words.len());
+            for i in 0..src_words.len() {
+                fill_ptr.cast::<u32>().add(i).write_volatile(SENTINEL);
+            }
+            budget_ptr.cast::<u32>().write_volatile(start);
+            count_ptr.cast::<u32>().write_volatile(count.unwrap_or(0));
+            h.list.CopyBufferRegion(&dst_buf, 0, &fill_buf, 0, bytes as u64);
+        }
+        h.submit_and_wait();
+        assert!(record_clamp(
+            &h.clamp,
+            &h.list,
+            (&dst_buf, 0),
+            budget_gpu,
+            (&src_buf, 0),
+            count.map(|_| (&count_buf, 0)),
+            (0, stride, records),
+            &[],
+        ));
+        done_on(&h.list, &dst_buf, &[]);
+        let at = std::time::Instant::now();
+        h.submit_and_wait();
+        let took = at.elapsed().as_secs_f64();
+        // SAFETY: a live device; an open list; mapped buffers.
+        unsafe {
+            if let Err(e) = h.device.GetDeviceRemovedReason() {
+                panic!("device removed after {took:.3} s with {records} records: {e}");
+            }
+            h.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            h.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, bytes as u64);
+            h.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        h.submit_and_wait();
+        // SAFETY: the GPU work is done.
+        unsafe {
+            let out = std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), src_words.len()).to_vec();
+            let after_src = std::slice::from_raw_parts(src_ptr.cast::<u32>().cast_const(), src_words.len());
+            assert_eq!(after_src, src_words, "the source is untouched");
+            (took, out, budget_ptr.cast::<u32>().read_volatile())
+        }
+    }
+
+    /// What the policy allows of a clamp's output; panics on a violation.
+    /// Returns (admitted positive-cost records, rejected ones, groups where
+    /// a positive-cost record was admitted after a rejected one).
+    fn check_policy(
+        name: &str,
+        stride: u32,
+        src: &[u32],
+        out: &[u32],
+        count: Option<u32>,
+        start: u32,
+        after: u32,
+    ) -> (usize, usize, usize) {
+        let words = (stride / 4) as usize;
+        let records = src.len() / words;
+        let eff = count.map_or(records, |c| records.min(c as usize));
+        let (mut admitted, mut rejected, mut unordered) = (0usize, 0usize, 0usize);
+        let mut spent = 0u64;
+        let mut all = 0u64;
+        let mut group_rejected = false;
+        for i in 0..records {
+            if i % 64 == 0 {
+                group_rejected = false;
+            }
+            let (s, o) = (&src[i * words..(i + 1) * words], &out[i * words..(i + 1) * words]);
+            if i >= eff {
+                assert!(o.iter().all(|&w| w == SENTINEL), "{name}: record {i} past the count was written");
+                continue;
+            }
+            assert_eq!(&o[2..], &s[2..], "{name}: record {i} lost its other words");
+            let c = s[0].min(1 << 24);
+            let n = s[1].min((1 << 26) / c.max(1));
+            let cost = u64::from(c) * u64::from(n);
+            all += cost;
+            if (o[0], o[1]) == (c, n) {
+                if cost > 0 {
+                    admitted += 1;
+                    spent += cost;
+                    if group_rejected {
+                        unordered += 1;
+                    }
+                }
+            } else {
+                assert_eq!((o[0], o[1]), (0, 0), "{name}: record {i} is neither kept nor emptied");
+                assert!(cost > 0, "{name}: record {i} costs nothing and was emptied");
+                rejected += 1;
+                group_rejected = true;
+            }
+        }
+        assert!(after <= CAP, "{name}: the budget word passed the budget ({after:#x})");
+        assert!(u64::from(start.min(CAP)) + spent <= u64::from(CAP), "{name}: admitted work passes the budget");
+        if rejected == 0 {
+            assert_eq!(u64::from(after), u64::from(start) + spent, "{name}: nothing rejected, budget is the sum");
+        } else {
+            assert_eq!(after, CAP, "{name}: a record was rejected, the budget is spent");
+        }
+        if u64::from(start) + all <= u64::from(CAP) {
+            assert_eq!(rejected, 0, "{name}: everything fits, nothing may be rejected");
+        }
+        (admitted, rejected, unordered)
+    }
+
+    fn xorshift(state: &mut u64) -> u32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (*state >> 16) as u32
+    }
+
+    /// Experiment: the budget policy of the clamp under test. Run with
+    /// VICTORY_EXP=1 (and VICTORY_CLAMP_HLSL / VICTORY_TEST_HW as wanted).
+    #[test]
+    fn exp_policy() {
+        if std::env::var_os("VICTORY_EXP").is_none() {
+            return;
+        }
+        let Some(mut h) = WarpHarness::new() else {
+            return;
+        };
+        let draws = |f: &dyn Fn(usize) -> (u32, u32), n: usize, stride: u32| -> Vec<u32> {
+            let words = (stride / 4) as usize;
+            let mut v = vec![0u32; n * words];
+            for i in 0..n {
+                let (c, k) = f(i);
+                v[i * words] = c;
+                v[i * words + 1] = k;
+                for w in 2..words {
+                    v[i * words + w] = 0x1000_0000 + (i * 8 + w) as u32;
+                }
+            }
+            v
+        };
+        let mut case = |name: &str, stride: u32, src: Vec<u32>, count: Option<u32>, start: u32| {
+            let (_, out, after) = run_clamp(&mut h, stride, &src, count, start);
+            let got = check_policy(name, stride, &src, &out, count, start, after);
+            eprintln!("policy {name}: admitted {} rejected {} unordered {} budget {after:#x}", got.0, got.1, got.2);
+            (got, after)
+        };
+        // Everything fits, with a partial last group.
+        let (got, after) = case("fits", 16, draws(&|i| (1 + (i as u32 % 7), 1 + (i as u32 % 3)), 1000, 16), None, 0);
+        assert_eq!(got.1, 0);
+        assert!(after > 0);
+        // Garbage: two records of 2^26 fit exactly.
+        let (got, _) = case("garbage", 20, draws(&|_| (u32::MAX, u32::MAX), 128, 20), None, 0);
+        assert_eq!((got.0, got.1), (2, 126));
+        // One group whose plain sum is 2^32.
+        let (got, _) = case("overflow", 16, draws(&|_| (1 << 24, 4), 64, 16), None, 0);
+        assert_eq!((got.0, got.1), (2, 62));
+        // An exact fit at lane 5, a rejected lane 6, a free lane 7, a rejected lane 8.
+        let (got, after) = case(
+            "exact",
+            16,
+            draws(&|i| if i == 7 { (9, 0) } else { (100, 1) }, 9, 16),
+            None,
+            CAP - 600,
+        );
+        assert_eq!((got.0, got.1, after), (6, 2, CAP));
+        // A spent budget.
+        let (got, after) = case("spent", 16, draws(&|i| (i as u32 % 2, 1), 200, 16), None, CAP);
+        assert_eq!((got.0, got.1, after), (0, 100, CAP));
+        // A count in the middle of a group; garbage past it is not charged.
+        let (got, after) = case(
+            "count",
+            24,
+            draws(&|i| if i < 70 { (3, 2) } else { (u32::MAX, u32::MAX) }, 200, 24),
+            Some(70),
+            5,
+        );
+        assert_eq!((got.0, got.1, after), (70, 0, 5 + 70 * 6));
+        // A count of zero and one past the records.
+        let (got, after) = case("count0", 16, draws(&|_| (u32::MAX, u32::MAX), 130, 16), Some(0), 7);
+        assert_eq!((got.0, got.1, after), (0, 0, 7));
+        let (got, _) = case("count-over", 16, draws(&|_| (2, 2), 130, 16), Some(u32::MAX), 0);
+        assert_eq!((got.0, got.1), (130, 0));
+        // Random mixes that run the budget out part of the way through.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for round in 0..6 {
+            let n = 1 + (xorshift(&mut seed) % 5000) as usize;
+            let mut costs = Vec::with_capacity(n);
+            for _ in 0..n {
+                let r = xorshift(&mut seed);
+                costs.push(match r % 16 {
+                    0 => (0, r >> 8),
+                    1 => (r >> 4, r >> 9),
+                    2 => (1 << 12, 1 << 6),
+                    _ => (1 + (r >> 8) % 4096, 1 + (r >> 20) % 16),
+                });
+            }
+            let start = match round % 3 {
+                0 => 0,
+                1 => CAP / 2,
+                _ => CAP - 100_000,
+            };
+            case(&format!("random{round}"), 16, draws(&|i| costs[i], n, 16), None, start);
+        }
+    }
+
+    /// Experiment: seconds for the clamp of N draws of one vertex instance
+    /// each, which all fit. VICTORY_BENCH=1024,4096 lists N; a run over
+    /// VICTORY_BENCH_STOP_MS (default 80) ends the test before larger N.
+    #[test]
+    fn exp_bench() {
+        let Some(list) = std::env::var("VICTORY_BENCH").ok() else {
+            return;
+        };
+        let stop = std::env::var("VICTORY_BENCH_STOP_MS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(80.0);
+        let Some(mut h) = WarpHarness::new() else {
+            return;
+        };
+        // Warm the pipeline up.
+        run_clamp(&mut h, 16, &[1, 1, 0, 0].repeat(64), None, 0);
+        for n in list.split(',').filter_map(|s| s.trim().parse::<usize>().ok()) {
+            let src = [1u32, 1, 0, 0].repeat(n);
+            let mut times = Vec::new();
+            for _ in 0..3 {
+                let (took, out, after) = run_clamp(&mut h, 16, &src, None, 0);
+                let got = check_policy("bench", 16, &src, &out, None, 0, after);
+                assert_eq!((got.0, got.1, after as usize), (n, 0, n));
+                times.push(took * 1000.0);
+                if took * 1000.0 > stop {
+                    break;
+                }
+            }
+            eprintln!("bench records={n} ms={times:.2?}");
+            if times.iter().any(|&t| t > stop) {
+                eprintln!("bench stopped: over {stop} ms");
+                break;
+            }
+        }
     }
 }
